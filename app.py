@@ -15,30 +15,48 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# Navigation -- persist selected page across refreshes via query params
-PAGES = ["Dashboard", "Upload Statement", "Transactions"]
-
 st.sidebar.title("Expense Tracker")
 
-# Read page from URL query param (survives browser refresh)
-params = st.query_params
-default_page = params.get("page", "Dashboard")
-if default_page not in PAGES:
-    default_page = "Dashboard"
-default_idx = PAGES.index(default_page)
+# --- Two-section navigation ---
+section = st.sidebar.radio(
+    "Section",
+    ["Statements", "Email"],
+    key="app_section",
+    horizontal=True,
+)
 
-selection = st.sidebar.radio("Navigate", PAGES, index=default_idx, key="nav_page")
+if section == "Statements":
+    st.sidebar.caption("Upload & manage bank/credit card statements")
+    page = st.sidebar.radio(
+        "Navigate",
+        ["Dashboard", "Upload Statement", "Transactions"],
+        key="stmt_page",
+    )
 
-# Write selection back to query params so a refresh keeps the same page
-if st.query_params.get("page") != selection:
-    st.query_params["page"] = selection
+    if page == "Dashboard":
+        from views.dashboard import render
+        render(email_only=False)
+    elif page == "Upload Statement":
+        from views.upload import render
+        render()
+    elif page == "Transactions":
+        from views.transactions import render
+        render(email_only=False)
 
-if selection == "Dashboard":
-    from pages.dashboard import render
-    render()
-elif selection == "Upload Statement":
-    from pages.upload import render
-    render()
-elif selection == "Transactions":
-    from pages.transactions import render
-    render()
+else:  # Email
+    st.sidebar.caption("Fetch transactions from email alerts")
+    page = st.sidebar.radio(
+        "Navigate",
+        ["Email Sync", "Dashboard", "Transactions"],
+        key="email_page",
+    )
+
+    if page == "Email Sync":
+        from views.email_sync import render
+        render()
+    elif page == "Dashboard":
+        from views.dashboard import render
+        render(email_only=True)
+    elif page == "Transactions":
+        from views.transactions import render
+        render(email_only=True)

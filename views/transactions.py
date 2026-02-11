@@ -1,8 +1,9 @@
-"""Transactions page – view, filter, edit categories, smart re-categorize."""
+"""Transactions page -- view, filter, edit categories, smart re-categorize."""
 
 import streamlit as st
 import pandas as pd
 from datetime import datetime
+from typing import Optional
 
 from core.database import (
     get_transactions,
@@ -13,8 +14,33 @@ from core.database import (
     bulk_update_categories,
     add_category,
     find_similar_transactions,
+    upsert_category_rule,
 )
 from core.categorizer import categorize_transactions
+
+
+# ---------------------------------------------------------------------------
+# Widget key helpers -- version counter prevents stale widget cache issues
+# ---------------------------------------------------------------------------
+
+def _cat_version(pfx: str) -> int:
+    """Return the current category-widget version for this section."""
+    return st.session_state.get(f"{pfx}_cat_version", 0)
+
+
+def _cat_key(pfx: str, txn_id: int) -> str:
+    """Build a versioned selectbox key for a transaction's category."""
+    return f"{pfx}cat_{txn_id}_v{_cat_version(pfx)}"
+
+
+def _bump_cat_version(pfx: str) -> None:
+    """Increment the category-widget version.
+
+    All old selectbox keys become orphaned; on the next render Streamlit
+    creates brand-new widgets that read their initial value from the DB
+    via the `index` parameter -- completely bypassing any cached state.
+    """
+    st.session_state[f"{pfx}_cat_version"] = _cat_version(pfx) + 1
 
 
 # ---------------------------------------------------------------------------
@@ -22,7 +48,7 @@ from core.categorizer import categorize_transactions
 # ---------------------------------------------------------------------------
 
 @st.dialog("Similar Transactions Found", width="large")
-def _recat_dialog(source_txn: dict, old_cat: str, new_cat: str, similar: list[dict]):
+def _recat_dialog(source_txn: dict, old_cat: str, new_cat: str, similar: list[dict], pfx: str):
     """Modal overlay for bulk re-categorizing similar transactions."""
     st.info(
         f'You changed **"{source_txn["description"][:60]}"** from '
@@ -39,7 +65,7 @@ def _recat_dialog(source_txn: dict, old_cat: str, new_cat: str, similar: list[di
         with col1:
             checked = st.checkbox(
                 "sel", value=True,
-                key=f"dlg_sel_{txn['id']}",
+                key=f"{pfx}dlg_sel_{txn['id']}",
                 label_visibility="collapsed",
             )
             if checked:
@@ -62,16 +88,15 @@ def _recat_dialog(source_txn: dict, old_cat: str, new_cat: str, similar: list[di
         ):
             if selected_ids:
                 bulk_update_categories({tid: new_cat for tid in selected_ids})
-                # Queue widget key clearing for the NEXT render cycle.
-                # We can't reliably pop keys inside a @st.dialog, so we
-                # store the IDs and let render() handle the cleanup.
-                st.session_state["_pending_clear_ids"] = selected_ids
-            st.session_state["scroll_to_txn"] = source_txn["id"]
+                # Bump widget version so ALL selectboxes are recreated fresh
+                # from DB values on the next render -- no stale cache possible.
+                _bump_cat_version(pfx)
+            st.session_state[f"{pfx}scroll_to_txn"] = source_txn["id"]
             st.rerun()
 
     with col_skip:
         if st.button("Skip", use_container_width=True):
-            st.session_state["scroll_to_txn"] = source_txn["id"]
+            st.session_state[f"{pfx}scroll_to_txn"] = source_txn["id"]
             st.rerun()
 
 
@@ -79,21 +104,18 @@ def _recat_dialog(source_txn: dict, old_cat: str, new_cat: str, similar: list[di
 # Main render
 # ---------------------------------------------------------------------------
 
-def render():
-    st.header("Transactions")
+def render(email_only: Optional[bool] = None):
+    # Key prefix to avoid widget collisions between Statements and Email sections
+    pfx = "et_" if email_only else "st_"
+    section_label = "Email" if email_only else "Statements"
 
-    # --- Process deferred widget key clearing from dialog actions ---
-    # Widget keys can't be reliably cleared inside @st.dialog, so the
-    # dialog stores IDs here and we clear them in the main render context.
-    pending_ids = st.session_state.pop("_pending_clear_ids", None)
-    if pending_ids:
-        _clear_widget_keys(pending_ids)
+    st.header(f"Transactions — {section_label}")
 
     # Clear the one-shot skip set from the previous cycle
-    st.session_state.pop("_skip_recat_ids", None)
+    st.session_state.pop(f"{pfx}_skip_recat_ids", None)
 
     # --- Scroll back to last-edited transaction if needed ---
-    scroll_target = st.session_state.pop("scroll_to_txn", None)
+    scroll_target = st.session_state.pop(f"{pfx}scroll_to_txn", None)
     if scroll_target is not None:
         _inject_scroll_js(scroll_target)
 
@@ -101,19 +123,22 @@ def render():
     with st.expander("Add custom category"):
         col_a, col_b = st.columns([3, 1])
         with col_a:
-            new_cat = st.text_input("Category name", key="new_cat_input")
+            new_cat = st.text_input("Category name", key=f"{pfx}new_cat_input")
         with col_b:
             st.write("")
             st.write("")
-            if st.button("Add Category") and new_cat.strip():
+            if st.button("Add Category", key=f"{pfx}add_cat_btn") and new_cat.strip():
                 add_category(new_cat.strip())
                 st.success(f"Added category: **{new_cat.strip()}**")
                 st.rerun()
 
     # --- Filters row ---
-    available = get_available_months()
+    available = get_available_months(email_only=email_only)
     if not available:
-        st.info("No transactions yet. Upload a statement first.")
+        if email_only:
+            st.info("No email transactions yet. Sync your email first.")
+        else:
+            st.info("No transactions yet. Upload a statement first.")
         return
 
     categories = get_all_categories()
@@ -124,7 +149,7 @@ def render():
         options = ["All months"] + [
             f"{datetime(y, m, 1).strftime('%B %Y')}" for y, m in available
         ]
-        selected = st.selectbox("Month", options, key="filter_month")
+        selected = st.selectbox("Month", options, key=f"{pfx}filter_month")
         if selected == "All months":
             sel_month, sel_year = None, None
         else:
@@ -132,20 +157,21 @@ def render():
             sel_year, sel_month = available[idx]
 
     with f2:
-        source_filter = st.selectbox("Source", ["All", "Bank", "Credit Card"], key="filter_source")
+        source_filter = st.selectbox("Source", ["All", "Bank", "Credit Card"], key=f"{pfx}filter_source")
         source_val = {"All": None, "Bank": "bank", "Credit Card": "credit_card"}[source_filter]
 
     with f3:
         cat_filter_opts = ["All categories", "Uncategorized"] + categories
-        cat_filter = st.selectbox("Category", cat_filter_opts, key="filter_category")
+        cat_filter = st.selectbox("Category", cat_filter_opts, key=f"{pfx}filter_category")
 
     with f4:
         sort_options = ["Date (newest)", "Date (oldest)", "Amount (high to low)", "Amount (low to high)", "Category A-Z"]
-        sort_by = st.selectbox("Sort by", sort_options, key="sort_by")
+        sort_by = st.selectbox("Sort by", sort_options, key=f"{pfx}sort_by")
 
     # --- Fetch and filter ---
     txns = get_transactions(
-        month=sel_month, year=sel_year, source=source_val, include_excluded=True
+        month=sel_month, year=sel_year, source=source_val,
+        include_excluded=True, email_only=email_only,
     )
 
     # Apply category filter
@@ -187,13 +213,15 @@ def render():
 
     with action_col1:
         if uncategorized_count > 0:
-            if st.button("Auto-categorize uncategorized", type="primary"):
+            if st.button("Auto-categorize uncategorized", type="primary", key=f"{pfx}auto_cat"):
                 _run_categorization(txns, categories)
+                _bump_cat_version(pfx)
                 st.rerun()
 
     with action_col2:
-        if st.button("Re-categorize ALL"):
+        if st.button("Re-categorize ALL", key=f"{pfx}recat_all"):
             _run_categorization(txns, categories, force_all=True)
+            _bump_cat_version(pfx)
             st.rerun()
 
     # --- Transaction list with per-row save ---
@@ -201,14 +229,14 @@ def render():
     st.caption("Category and Excluded changes save immediately.")
 
     for i, txn in enumerate(txns):
-        _render_transaction_row(txn, categories, i)
+        _render_transaction_row(txn, categories, i, pfx, email_only)
 
     # --- Open recat dialog if triggered (renders as popup over the page) ---
-    if st.session_state.get("pending_recat"):
-        data = st.session_state.pop("pending_recat")
+    if st.session_state.get(f"{pfx}pending_recat"):
+        data = st.session_state.pop(f"{pfx}pending_recat")
         _recat_dialog(
             data["source_txn"], data["old_cat"],
-            data["new_cat"], data["similar"],
+            data["new_cat"], data["similar"], pfx,
         )
 
 
@@ -216,7 +244,91 @@ def render():
 # Transaction row
 # ---------------------------------------------------------------------------
 
-def _render_transaction_row(txn: dict, categories: list[str], idx: int):
+def _friendly_description(desc: str) -> str:
+    """Extract a human-friendly merchant/payee name from bank descriptions.
+
+    UPI descriptions look like: UPI/P2M/123456/Merchant Name/Bank/...
+    NEFT: NEFT/REF/Name/Bank/...
+    ECOM PUR: ECOM PUR/Merchant/City/Date/...
+    ACH-DR: ACH-DR-CLEARING CORP-RefNo
+    """
+    if not desc:
+        return desc
+
+    d = desc.strip()
+
+    # UPI: extract merchant/payee name (4th segment usually)
+    if d.upper().startswith("UPI/"):
+        parts = d.split("/")
+        if len(parts) >= 4:
+            name = parts[3].strip()
+            # Clean up padding spaces
+            name = " ".join(name.split())
+            if name:
+                return name
+        return d
+
+    # NEFT: extract payee name (3rd segment)
+    if d.upper().startswith("NEFT/"):
+        parts = d.split("/")
+        if len(parts) >= 3:
+            name = parts[2].strip()
+            name = " ".join(name.split())
+            if name:
+                return name
+        return d
+
+    # RTGS: extract payee name (3rd segment)
+    if d.upper().startswith("RTGS/"):
+        parts = d.split("/")
+        if len(parts) >= 3:
+            name = parts[2].strip()
+            name = " ".join(name.split())
+            if name:
+                return name
+        return d
+
+    # ECOM PUR: extract merchant (2nd segment)
+    if d.upper().startswith("ECOM PUR/"):
+        parts = d.split("/")
+        if len(parts) >= 2:
+            return parts[1].strip()
+        return d
+
+    # ACH-DR: extract entity name
+    if d.upper().startswith("ACH-DR-"):
+        remainder = d[7:]  # strip "ACH-DR-"
+        # Usually: "ENTITY NAME-RefNumber"
+        dash_parts = remainder.rsplit("-", 1)
+        if len(dash_parts) == 2 and len(dash_parts[1]) > 10:
+            return f"ACH: {dash_parts[0]}"
+        return f"ACH: {remainder}"
+
+    return d
+
+
+def _learn_category_rule(description: str, category: str) -> None:
+    """Extract the merchant/payee keyword from a description and save as a rule.
+
+    Uses _friendly_description to get the meaningful name, then stores it
+    so future transactions with the same merchant auto-categorize.
+    """
+    keyword = _friendly_description(description)
+    # Skip if the friendly name is the same as the raw description (no extraction)
+    # or if it's too generic
+    if not keyword or len(keyword) < 3:
+        return
+    # Skip generic keywords that would match too broadly
+    skip = {"no description", "transaction", "payment", "upi", "neft", "rtgs", "ach"}
+    if keyword.lower() in skip:
+        return
+    upsert_category_rule(keyword, category, source="user")
+
+
+def _render_transaction_row(
+    txn: dict, categories: list[str], idx: int,
+    pfx: str, email_only: Optional[bool],
+):
     """Render a single transaction row with immediate-save controls."""
     txn_id = txn["id"]
     is_excluded = bool(txn["is_excluded"])
@@ -225,104 +337,97 @@ def _render_transaction_row(txn: dict, categories: list[str], idx: int):
     # Anchor for scroll-back
     st.html(f'<div id="txn-{txn_id}"></div>')
 
+    serial = idx + 1
+    source_label = "Bank" if txn["source"] == "bank" else "CC"
+    type_label = "Dr" if txn["type"] == "debit" else "Cr"
+
     with st.container():
-        #             Date  Type   Description  Amount  Excl  Category
-        cols = st.columns([0.7, 0.7, 4.0, 1.0, 0.5, 2.2])
+        #             Info       Description  Amount  Excl  Category
+        cols = st.columns([1.2, 4.0, 1.0, 0.4, 2.2])
 
         with cols[0]:
-            st.caption("Date")
-            st.write(txn["date"])
+            # Compact info block: S.No, ID, Date, Type in one column
+            st.caption(f"#{serial}  |  ID: {txn_id}")
+            st.write(f"{txn['date']}  {type_label}/{source_label}")
 
         with cols[1]:
-            source_label = "Bank" if txn["source"] == "bank" else "CC"
-            type_label = "Dr" if txn["type"] == "debit" else "Cr"
-            st.caption("Type")
-            st.write(f"{type_label}/{source_label}")
-
-        with cols[2]:
             st.caption("Description")
             desc = txn["description"]
+            friendly = _friendly_description(desc)
             if is_cc:
-                st.write(f":orange[CC: {desc[:85]}]")
+                st.write(f":orange[CC: {friendly}]")
             elif is_excluded:
-                st.write(f":grey[{desc[:85]}]")
+                st.write(f":grey[{friendly}]")
             else:
-                st.write(desc[:85])
+                st.write(friendly)
+            if friendly != desc:
+                st.caption(desc)
 
-        with cols[3]:
+        with cols[2]:
             st.caption("Amount")
             color = "red" if txn["type"] == "debit" else "green"
             st.write(f":{color}[₹{txn['amount']:,.2f}]")
 
-        with cols[4]:
+        with cols[3]:
             st.caption("Excl.")
             new_excluded = st.checkbox(
-                "x", value=is_excluded, key=f"excl_{txn_id}",
+                "x", value=is_excluded, key=f"{pfx}excl_{txn_id}",
                 label_visibility="collapsed",
             )
             if new_excluded != is_excluded:
                 update_transaction_exclusion(txn_id, new_excluded)
-                st.session_state["scroll_to_txn"] = txn_id
+                st.session_state[f"{pfx}scroll_to_txn"] = txn_id
                 st.rerun()
 
-        with cols[5]:
+        with cols[4]:
             current_cat = txn.get("category") or ""
             cat_options = [""] + categories
             current_idx = cat_options.index(current_cat) if current_cat in cat_options else 0
 
+            # Versioned key: bumps after bulk updates so widgets are recreated fresh
             new_cat = st.selectbox(
                 "Category", options=cat_options, index=current_idx,
-                key=f"cat_{txn_id}", label_visibility="collapsed",
+                key=_cat_key(pfx, txn_id), label_visibility="collapsed",
             )
-            # Only act on genuine user changes, not stale widget state
-            if new_cat != current_cat and new_cat and txn_id not in st.session_state.get("_skip_recat_ids", set()):
+            skip_set = st.session_state.get(f"{pfx}_skip_recat_ids", set())
+            if new_cat != current_cat and new_cat and txn_id not in skip_set:
                 update_transaction_category(txn_id, new_cat)
-                _clear_widget_keys([txn_id])
-                _trigger_smart_recat(txn, current_cat, new_cat)
+                # Learn from this correction: extract merchant/payee and save as rule
+                _learn_category_rule(txn["description"], new_cat)
+                # Add to skip set so the immediate rerun from
+                # _trigger_smart_recat doesn't re-detect the change
+                skip_set.add(txn_id)
+                st.session_state[f"{pfx}_skip_recat_ids"] = skip_set
+                _trigger_smart_recat(txn, current_cat, new_cat, pfx, email_only)
 
         st.divider()
-
-
-# ---------------------------------------------------------------------------
-# Widget state management
-# ---------------------------------------------------------------------------
-
-def _clear_widget_keys(txn_ids: list[int]):
-    """Remove stale selectbox keys from session_state.
-
-    When we save a category to the DB, the selectbox widget key still holds
-    the old value. On the next render Streamlit uses the stale widget value
-    instead of the `index` parameter, causing a phantom mismatch. Deleting
-    the key forces Streamlit to treat it as a fresh widget.
-    """
-    skip_set: set = st.session_state.get("_skip_recat_ids", set())
-    for tid in txn_ids:
-        st.session_state.pop(f"cat_{tid}", None)
-        skip_set.add(tid)
-    st.session_state["_skip_recat_ids"] = skip_set
 
 
 # ---------------------------------------------------------------------------
 # Smart re-categorization trigger
 # ---------------------------------------------------------------------------
 
-def _trigger_smart_recat(txn: dict, old_category: str, new_category: str):
+def _trigger_smart_recat(
+    txn: dict, old_category: str, new_category: str,
+    pfx: str, email_only: Optional[bool],
+):
     """Find similar transactions; if any, queue the dialog to open."""
     similar = find_similar_transactions(
         txn["description"], txn["id"],
         old_category if old_category else None,
+        email_only=email_only,
     )
     if similar:
-        st.session_state["pending_recat"] = {
+        st.session_state[f"{pfx}pending_recat"] = {
             "source_txn": txn,
             "old_cat": old_category or "Uncategorized",
             "new_cat": new_category,
             "similar": similar,
         }
-        st.session_state["scroll_to_txn"] = txn["id"]
+        st.session_state[f"{pfx}scroll_to_txn"] = txn["id"]
         st.rerun()
     else:
-        st.session_state["scroll_to_txn"] = txn["id"]
+        st.session_state[f"{pfx}scroll_to_txn"] = txn["id"]
         st.rerun()
 
 

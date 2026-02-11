@@ -1,11 +1,10 @@
 """
-LLM-based transaction categorisation using a local Ollama instance.
+Three-layer transaction categorisation:
 
-Ollama runs free, locally on your machine. No API key required.
-Install: https://ollama.com  then run:  ollama pull llama3.2
+Layer 1: Rule-based matching from user corrections (instant, 100% accurate)
+Layer 2: LLM with enriched context (few-shot examples, email body, metadata)
 
-Transactions are batched to keep prompt sizes manageable. The prompt asks
-the model to return a strict JSON mapping of index -> category.
+Uses a local Ollama instance. No API key required.
 """
 
 import json
@@ -15,12 +14,23 @@ from typing import Optional
 
 import requests
 
+from core.database import (
+    apply_rules_to_transactions,
+    bulk_update_categories,
+    get_categorized_examples,
+    get_all_rules,
+)
+
 logger = logging.getLogger(__name__)
 
-BATCH_SIZE = 20  # slightly smaller batches for local models
+BATCH_SIZE = 15  # smaller batches = more attention per transaction
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.2")
 
+
+# ---------------------------------------------------------------------------
+# Ollama helpers (unchanged)
+# ---------------------------------------------------------------------------
 
 def _check_ollama_running() -> bool:
     """Return True if the Ollama server is reachable."""
@@ -32,43 +42,18 @@ def _check_ollama_running() -> bool:
 
 
 def _get_available_models() -> list[str]:
-    """Return list of model names pulled locally in Ollama."""
     try:
         resp = requests.get(f"{OLLAMA_BASE_URL}/api/tags", timeout=5)
         if resp.status_code == 200:
-            data = resp.json()
-            return [m["name"] for m in data.get("models", [])]
+            return [m["name"] for m in resp.json().get("models", [])]
     except Exception:
         pass
     return []
 
 
-def _build_prompt(descriptions: list[str], categories: list[str]) -> str:
-    """Build the categorisation prompt."""
-    cat_list = ", ".join(categories)
-    txn_lines = "\n".join(f'  {i}: "{desc}"' for i, desc in enumerate(descriptions))
-
-    return f"""You are a personal finance assistant. Categorise each transaction below into exactly ONE of these categories:
-[{cat_list}]
-
-Transactions:
-{txn_lines}
-
-Rules:
-- Return ONLY a valid JSON object mapping the index (as string) to the chosen category.
-- If you are unsure, use "Other".
-- Do NOT add any explanation, markdown formatting, or extra text.
-- Your entire response must be parseable JSON. Nothing else.
-
-Example output:
-{{"0": "Food", "1": "Shopping", "2": "Rent"}}
-"""
-
-
 def _call_ollama(prompt: str, model: Optional[str] = None) -> Optional[str]:
     """Send a prompt to Ollama and return the response text."""
     model = model or OLLAMA_MODEL
-
     try:
         resp = requests.post(
             f"{OLLAMA_BASE_URL}/api/generate",
@@ -77,22 +62,18 @@ def _call_ollama(prompt: str, model: Optional[str] = None) -> Optional[str]:
                 "prompt": prompt,
                 "stream": False,
                 "options": {
-                    "temperature": 0.1,  # low temp for consistent categorisation
+                    "temperature": 0.1,
                     "num_predict": 2048,
                 },
             },
-            timeout=120,  # local models can be slow on first call
+            timeout=120,
         )
-
         if resp.status_code != 200:
             logger.warning("Ollama returned status %d: %s", resp.status_code, resp.text[:200])
             return None
-
-        data = resp.json()
-        return data.get("response", "").strip()
-
+        return resp.json().get("response", "").strip()
     except requests.ConnectionError:
-        logger.error("Cannot connect to Ollama at %s. Is it running?", OLLAMA_BASE_URL)
+        logger.error("Cannot connect to Ollama at %s", OLLAMA_BASE_URL)
         return None
     except requests.Timeout:
         logger.warning("Ollama request timed out")
@@ -103,26 +84,20 @@ def _call_ollama(prompt: str, model: Optional[str] = None) -> Optional[str]:
 
 
 def _parse_json_response(text: str) -> Optional[dict]:
-    """Extract and parse JSON from the model response, handling markdown fences."""
+    """Extract and parse JSON from the model response."""
     if not text:
         return None
-
-    # Strip markdown code fences if present
     cleaned = text.strip()
     if cleaned.startswith("```"):
-        # Remove opening fence (possibly with language tag)
         cleaned = cleaned.split("\n", 1)[-1] if "\n" in cleaned else cleaned[3:]
     if cleaned.endswith("```"):
         cleaned = cleaned.rsplit("```", 1)[0]
     cleaned = cleaned.strip()
 
-    # Try direct parse
     try:
         return json.loads(cleaned)
     except json.JSONDecodeError:
         pass
-
-    # Try to find JSON object in the text
     start = cleaned.find("{")
     end = cleaned.rfind("}")
     if start != -1 and end != -1 and end > start:
@@ -130,53 +105,158 @@ def _parse_json_response(text: str) -> Optional[dict]:
             return json.loads(cleaned[start : end + 1])
         except json.JSONDecodeError:
             pass
-
     logger.warning("Could not parse JSON from response: %s", cleaned[:200])
     return None
 
+
+# ---------------------------------------------------------------------------
+# Enriched prompt builder (Layer 2)
+# ---------------------------------------------------------------------------
+
+def _build_enriched_prompt(
+    batch: list[dict],
+    categories: list[str],
+    examples: list[dict],
+    rules: list[dict],
+) -> str:
+    """Build a rich categorisation prompt with Indian context and few-shot examples."""
+    cat_list = ", ".join(categories)
+
+    # Few-shot examples from user's own history + rules
+    example_lines = []
+    seen_examples = set()
+
+    # Rules first (highest confidence)
+    for rule in rules[:15]:
+        key = f"{rule['keyword']}|{rule['category']}"
+        if key not in seen_examples:
+            example_lines.append(f'  - "{rule["keyword"]}" -> {rule["category"]}')
+            seen_examples.add(key)
+
+    # Then past categorized transactions (for diversity)
+    for ex in examples:
+        key = f"{ex['description'][:40]}|{ex['category']}"
+        if key not in seen_examples and len(example_lines) < 25:
+            example_lines.append(
+                f'  - "{ex["description"][:60]}" -> {ex["category"]}'
+            )
+            seen_examples.add(key)
+
+    examples_block = "\n".join(example_lines) if example_lines else "  (no examples yet)"
+
+    # Transaction lines with metadata
+    txn_lines = []
+    for i, t in enumerate(batch):
+        amt = t.get("amount", 0)
+        txn_type = t.get("type", "debit").upper()
+        date = t.get("date", "")
+        desc = t["description"]
+
+        line = f'  {i}: [{txn_type} Rs {amt:,.0f}, {date}] "{desc}"'
+
+        # Add email body context if available (truncated for prompt size)
+        email_body = t.get("email_body") or ""
+        if email_body:
+            # Extract the most useful sentence from the email
+            clean_body = email_body[:300].replace("\n", " ").strip()
+            line += f'\n     Email: "{clean_body}"'
+
+        txn_lines.append(line)
+
+    txn_block = "\n".join(txn_lines)
+
+    return f"""You are a personal finance assistant for an Indian user. Categorise each transaction into exactly ONE category.
+
+Categories: [{cat_list}]
+
+Indian banking context:
+- UPI P2M = payment to merchant (shop/restaurant/service)
+- UPI P2A = payment to a person (could be rent, food, services, or transfer)
+- ACH-DR = automated debit (EMI, insurance, SIP investment, subscription)
+- NEFT/RTGS/IMPS = bank transfers (often rent, salary, or self-transfer)
+- ECOM PUR = online purchase (shopping)
+- CRED/CRED Club = credit card bill payment
+- Swiggy/Zomato = Food delivery
+- BookMyShow = Entertainment
+- Common Indian merchant keywords: Bigbasket/Blinkit/Zepto = Groceries, Ola/Uber/Rapido = Travel
+
+How THIS USER categorises (learn from these):
+{examples_block}
+
+Transactions to categorise:
+{txn_block}
+
+Rules:
+- Return ONLY a valid JSON object mapping index (as string) to category.
+- Use the user's past patterns above as strong guidance.
+- If a person's name appears (UPI P2A), look at the amount for clues:
+  small amounts (Rs 50-500) to the same person = likely Food/Services,
+  large amounts (Rs 5000+) = likely Rent/Transfer.
+- If unsure, use "Other".
+- NO explanation, NO markdown, ONLY JSON.
+
+Example output: {{"0": "Food", "1": "Shopping", "2": "Rent"}}
+"""
+
+
+# ---------------------------------------------------------------------------
+# Main categorisation flow (3-layer)
+# ---------------------------------------------------------------------------
 
 def categorize_transactions(
     transactions: list[dict],
     categories: list[str],
     model_name: Optional[str] = None,
 ) -> dict[int, str]:
-    """Categorise a list of transactions using a local Ollama model.
+    """Categorise transactions using a 3-layer approach:
+
+    Layer 1: Apply keyword rules from user corrections (instant, exact).
+    Layer 2: LLM with enriched context for remaining transactions.
 
     Args:
-        transactions: list of dicts with at least a 'description' key and an 'id' key.
+        transactions: list of dicts with 'id', 'description', and optionally
+                      'amount', 'type', 'date', 'email_body'.
         categories: allowed category names.
-        model_name: Ollama model to use (defaults to OLLAMA_MODEL env var or llama3.2).
 
     Returns:
         dict mapping transaction id -> category string.
-
-    Raises:
-        RuntimeError: if Ollama is not running or the model is not available.
     """
+    if not transactions:
+        return {}
+
+    all_results: dict[int, str] = {}
+
+    # --- Layer 1: Rule-based matching ---
+    rule_matches = apply_rules_to_transactions(transactions)
+    if rule_matches:
+        all_results.update(rule_matches)
+        logger.info("Layer 1 (rules): matched %d / %d transactions", len(rule_matches), len(transactions))
+
+    # --- Layer 2: LLM for remaining ---
+    remaining = [t for t in transactions if t["id"] not in all_results]
+
+    if not remaining:
+        return all_results
+
     if not _check_ollama_running():
         raise RuntimeError(
-            f"Ollama is not running at {OLLAMA_BASE_URL}. "
-            "Start it with: ollama serve"
+            f"Ollama is not running at {OLLAMA_BASE_URL}. Start it with: ollama serve"
         )
 
     model = model_name or OLLAMA_MODEL
     available = _get_available_models()
-    # Check if model (or a variant like "llama3.2:latest") is available
-    model_found = any(model in m for m in available)
-    if not model_found and available:
-        logger.info(
-            "Model '%s' not found locally. Available: %s. Attempting anyway...",
-            model, available,
-        )
+    if not any(model in m for m in available) and available:
+        logger.info("Model '%s' not found. Available: %s", model, available)
 
-    results: dict[int, str] = {}
+    # Fetch few-shot examples and rules for the prompt
+    examples = get_categorized_examples(limit=30)
+    rules = get_all_rules()
 
-    for start in range(0, len(transactions), BATCH_SIZE):
-        batch = transactions[start : start + BATCH_SIZE]
-        descriptions = [t["description"] for t in batch]
+    for start in range(0, len(remaining), BATCH_SIZE):
+        batch = remaining[start : start + BATCH_SIZE]
         ids = [t["id"] for t in batch]
 
-        prompt = _build_prompt(descriptions, categories)
+        prompt = _build_enriched_prompt(batch, categories, examples, rules)
         response_text = _call_ollama(prompt, model)
         mapping = _parse_json_response(response_text)
 
@@ -188,13 +268,17 @@ def categorize_transactions(
                     continue
                 if 0 <= idx < len(batch):
                     if category in categories:
-                        results[ids[idx]] = category
+                        all_results[ids[idx]] = category
                     else:
-                        results[ids[idx]] = "Other"
+                        all_results[ids[idx]] = "Other"
         else:
             logger.warning("No valid mapping for batch starting at %d", start)
 
-    return results
+    logger.info(
+        "Categorization complete: %d rule-matched, %d LLM-categorized, %d total",
+        len(rule_matches), len(all_results) - len(rule_matches), len(all_results),
+    )
+    return all_results
 
 
 def categorize_single(
@@ -206,7 +290,10 @@ def categorize_single(
     if not _check_ollama_running():
         return None
 
-    prompt = _build_prompt([description], categories)
+    examples = get_categorized_examples(limit=15)
+    rules = get_all_rules()
+    txn = {"id": -1, "description": description}
+    prompt = _build_enriched_prompt([txn], categories, examples, rules)
     response_text = _call_ollama(prompt, model_name)
     mapping = _parse_json_response(response_text)
 

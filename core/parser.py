@@ -1,18 +1,25 @@
 """
-Statement parser for CSV, Excel, and PDF bank/credit-card statements.
+Statement parser for CSV, Excel, PDF, and image (PNG/JPEG) bank statements.
 
 The goal is to normalise every statement into a list of dicts with keys:
     date, description, amount, type ('credit' | 'debit')
 """
 
+import base64
 import csv
 import io
+import json
+import logging
+import os
 import re
 from datetime import datetime
 from typing import Optional
 
 import pandas as pd
 import pdfplumber
+import requests
+
+logger = logging.getLogger(__name__)
 
 
 # ---- Common date formats found in Indian bank statements ----
@@ -362,5 +369,149 @@ def _parse_pdf_text(text: str) -> list[dict]:
                 continue
             txn_type = "credit" if dr_cr and dr_cr.upper() == "CR" else "debit"
             transactions.append({"date": parsed_date, "description": desc.strip(), "amount": amt, "type": txn_type})
+
+    return transactions
+
+
+# ---------------------------------------------------------------------------
+# Image parsing (PNG, JPEG) via Ollama vision model
+# ---------------------------------------------------------------------------
+
+OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+OLLAMA_VISION_MODEL = os.getenv("OLLAMA_VISION_MODEL", "llama3.2-vision")
+
+
+def _check_vision_model() -> tuple[bool, str]:
+    """Check if the Ollama vision model is available. Returns (ok, message)."""
+    try:
+        resp = requests.get(f"{OLLAMA_BASE_URL}/api/tags", timeout=5)
+        if resp.status_code != 200:
+            return False, "Ollama is not responding."
+        models = [m["name"] for m in resp.json().get("models", [])]
+        # Check for the configured vision model or common variants
+        for m in models:
+            if OLLAMA_VISION_MODEL in m:
+                return True, m
+        return False, (
+            f"Vision model '{OLLAMA_VISION_MODEL}' not found. "
+            f"Available models: {models}. "
+            f"Run: ollama pull {OLLAMA_VISION_MODEL}"
+        )
+    except requests.ConnectionError:
+        return False, "Ollama is not running. Start it with: ollama serve"
+
+
+def parse_image(file_bytes: bytes) -> list[dict]:
+    """Extract transactions from a bank statement screenshot using Ollama vision.
+
+    Sends the image to a local vision model which reads the table and returns
+    structured JSON that we parse into our standard transaction format.
+
+    Raises RuntimeError if the vision model is not available.
+    """
+    ok, msg = _check_vision_model()
+    if not ok:
+        raise RuntimeError(f"Image parsing unavailable: {msg}")
+
+    b64_image = base64.b64encode(file_bytes).decode("utf-8")
+
+    prompt = """You are reading a bank or credit card statement screenshot.
+Extract ALL transactions visible in the image as a JSON array.
+
+Each transaction must have these fields:
+- "date": the transaction date in DD-MM-YYYY or DD/MM/YYYY format
+- "description": the narration or description text
+- "amount": the numeric amount (no commas or currency symbols)
+- "type": "debit" if money was spent/withdrawn, "credit" if money was received/deposited
+
+Rules:
+- Return ONLY a valid JSON array. No explanation, no markdown.
+- If you can see debit and credit columns, use them to determine the type.
+- If there's only one amount column, look for Dr/Cr indicators or use context.
+- Include ALL rows you can read, even partially visible ones.
+
+Example output:
+[{"date": "01-01-2026", "description": "UPI/SWIGGY", "amount": 500, "type": "debit"}]
+"""
+
+    try:
+        resp = requests.post(
+            f"{OLLAMA_BASE_URL}/api/generate",
+            json={
+                "model": OLLAMA_VISION_MODEL,
+                "prompt": prompt,
+                "images": [b64_image],
+                "stream": False,
+                "options": {"temperature": 0.1, "num_predict": 4096},
+            },
+            timeout=180,
+        )
+
+        if resp.status_code != 200:
+            error_text = resp.text[:300]
+            raise RuntimeError(f"Ollama vision error ({resp.status_code}): {error_text}")
+
+        text = resp.json().get("response", "").strip()
+        return _parse_vision_response(text)
+
+    except requests.ConnectionError:
+        raise RuntimeError(f"Cannot connect to Ollama at {OLLAMA_BASE_URL}. Is it running?")
+    except RuntimeError:
+        raise
+    except Exception as e:
+        raise RuntimeError(f"Image parsing failed: {e}")
+
+
+def _parse_vision_response(text: str) -> list[dict]:
+    """Parse the JSON array returned by the vision model."""
+    # Strip markdown fences
+    cleaned = text.strip()
+    if cleaned.startswith("```"):
+        cleaned = cleaned.split("\n", 1)[-1] if "\n" in cleaned else cleaned[3:]
+    if cleaned.endswith("```"):
+        cleaned = cleaned.rsplit("```", 1)[0]
+    cleaned = cleaned.strip()
+
+    # Find the JSON array
+    start = cleaned.find("[")
+    end = cleaned.rfind("]")
+    if start == -1 or end == -1:
+        logger.warning("No JSON array in vision response: %s", cleaned[:200])
+        return []
+
+    try:
+        raw_list = json.loads(cleaned[start : end + 1])
+    except json.JSONDecodeError:
+        logger.warning("Invalid JSON from vision model: %s", cleaned[:200])
+        return []
+
+    transactions = []
+    for item in raw_list:
+        if not isinstance(item, dict):
+            continue
+        date_str = str(item.get("date", ""))
+        parsed_date = _parse_date(date_str)
+        if not parsed_date:
+            continue
+
+        desc = str(item.get("description", "")).strip()
+        if not desc:
+            desc = "No description"
+
+        raw_amt = item.get("amount")
+        amt = _clean_amount(raw_amt)
+        if not amt or amt <= 0:
+            continue
+
+        txn_type = str(item.get("type", "debit")).lower()
+        if txn_type not in ("debit", "credit"):
+            txn_type = "debit"
+
+        transactions.append({
+            "date": parsed_date,
+            "description": desc,
+            "amount": amt,
+            "type": txn_type,
+        })
 
     return transactions
