@@ -1,10 +1,13 @@
 import re
+import shutil
 import sqlite3
 import os
 from contextlib import contextmanager
 from typing import Optional
 
-DB_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "expense_tracker.db")
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(__file__))
+DB_PATH = os.path.join(_PROJECT_ROOT, "data", "expense_tracker.db")
+BACKUP_PATH = os.path.join(_PROJECT_ROOT, "backups", "expense_tracker_latest.db")
 
 DEFAULT_CATEGORIES = [
     "Food", "Travel", "Shopping", "Rent", "Utilities",
@@ -31,8 +34,16 @@ def get_connection():
 
 
 def init_db():
-    """Create tables if they don't exist and seed default categories."""
+    """Create tables if they don't exist and seed default categories.
+
+    On cloud deployments (Streamlit Cloud), the data/ directory is empty.
+    If a backup exists in backups/, restore from it automatically.
+    """
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+
+    # Auto-restore from backup if local DB doesn't exist (cloud deploy)
+    if not os.path.exists(DB_PATH) and os.path.exists(BACKUP_PATH):
+        shutil.copy2(BACKUP_PATH, DB_PATH)
 
     with get_connection() as conn:
         conn.execute("""

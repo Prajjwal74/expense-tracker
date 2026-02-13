@@ -239,12 +239,17 @@ def main():
     if uncat_count:
         body += f"\n{uncat_count} need review"
 
-    laptop_url = "http://localhost:8501/?section=Email&page=Transactions"
+    # Use cloud URL if set, otherwise fall back to localhost
+    cloud_url = os.getenv("APP_URL", "").strip()
+    if cloud_url:
+        review_url = f"{cloud_url}/?section=Email&page=Transactions"
+    else:
+        review_url = "http://localhost:8501/?section=Email&page=Transactions"
 
     logger.info("Summary: %s", title)
     logger.info("Details: %s", body.replace("\n", " | "))
 
-    _send_notification(title, body, url=laptop_url)
+    _send_notification(title, body, url=review_url)
     logger.info("Done.")
 
 

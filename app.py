@@ -15,6 +15,33 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
+# --- Password protection (for cloud deployment) ---
+def _check_password() -> bool:
+    """Return True if password is correct or not configured."""
+    try:
+        app_password = st.secrets["APP_PASSWORD"]
+    except (KeyError, FileNotFoundError):
+        return True  # no password configured, allow access
+
+    if not app_password:
+        return True
+
+    if st.session_state.get("authenticated"):
+        return True
+
+    st.title("Expense Tracker")
+    pwd = st.text_input("Enter password to continue", type="password", key="login_pwd")
+    if st.button("Login", type="primary"):
+        if pwd == app_password:
+            st.session_state["authenticated"] = True
+            st.rerun()
+        else:
+            st.error("Incorrect password.")
+    return False
+
+if not _check_password():
+    st.stop()
+
 st.sidebar.title("Expense Tracker")
 
 # --- Restore navigation from URL on first load ---
