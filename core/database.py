@@ -79,11 +79,15 @@ def init_db():
             )
         """)
 
-        # Add email_body column if it doesn't exist yet (safe migration)
-        try:
-            conn.execute("ALTER TABLE transactions ADD COLUMN email_body TEXT")
-        except sqlite3.OperationalError:
-            pass  # column already exists
+        # Safe migrations (columns may already exist)
+        for migration in [
+            "ALTER TABLE transactions ADD COLUMN email_body TEXT",
+            "ALTER TABLE category_rules ADD COLUMN txn_type TEXT",
+        ]:
+            try:
+                conn.execute(migration)
+            except sqlite3.OperationalError:
+                pass
 
         # Seed default categories
         for cat in DEFAULT_CATEGORIES:
@@ -113,39 +117,51 @@ def add_category(name: str) -> None:
 # Category rules (learned from user corrections)
 # ---------------------------------------------------------------------------
 
-def upsert_category_rule(keyword: str, category: str, source: str = "user") -> None:
+def upsert_category_rule(
+    keyword: str, category: str, source: str = "user",
+    txn_type: Optional[str] = None,
+) -> None:
     """Create or update a keyword-to-category rule.
 
-    If the keyword+category pair already exists, bump match_count.
-    If the keyword exists with a DIFFERENT category, update it.
+    Args:
+        keyword: merchant/payee name to match against descriptions.
+        category: category to assign.
+        source: 'user' (manual correction) or 'confirmed'.
+        txn_type: 'debit', 'credit', or None (matches both).
     """
     keyword = keyword.strip()
     if not keyword or len(keyword) < 2:
         return
 
     with get_connection() as conn:
-        existing = conn.execute(
-            "SELECT id, category FROM category_rules WHERE UPPER(keyword) = UPPER(?)",
-            (keyword,),
-        ).fetchone()
+        # Match on keyword + txn_type (a keyword can map to different categories
+        # for debit vs credit, e.g. "INDIAN CLEARING" -> Investment for debit, Salary for credit)
+        if txn_type:
+            existing = conn.execute(
+                "SELECT id, category FROM category_rules WHERE UPPER(keyword) = UPPER(?) AND txn_type = ?",
+                (keyword, txn_type),
+            ).fetchone()
+        else:
+            existing = conn.execute(
+                "SELECT id, category FROM category_rules WHERE UPPER(keyword) = UPPER(?) AND txn_type IS NULL",
+                (keyword,),
+            ).fetchone()
 
         if existing:
             if existing["category"] == category:
-                # Same rule exists -- bump confidence
                 conn.execute(
                     "UPDATE category_rules SET match_count = match_count + 1 WHERE id = ?",
                     (existing["id"],),
                 )
             else:
-                # Keyword mapped to different category -- user is overriding
                 conn.execute(
                     "UPDATE category_rules SET category = ?, match_count = 1, source = ? WHERE id = ?",
                     (category, source, existing["id"]),
                 )
         else:
             conn.execute(
-                "INSERT INTO category_rules (keyword, category, source) VALUES (?, ?, ?)",
-                (keyword, category, source),
+                "INSERT INTO category_rules (keyword, category, source, txn_type) VALUES (?, ?, ?, ?)",
+                (keyword, category, source, txn_type),
             )
 
 
@@ -161,6 +177,10 @@ def get_all_rules() -> list[dict]:
 def apply_rules_to_transactions(transactions: list[dict]) -> dict[int, str]:
     """Apply stored keyword rules to a list of transactions.
 
+    Rules with a specific txn_type (debit/credit) only match transactions
+    of that type. Rules with txn_type=NULL match any type.
+    Type-specific rules take priority over generic ones.
+
     Returns a dict mapping transaction id -> category for matches.
     Transactions without a match are not included (left for the LLM).
     """
@@ -168,15 +188,40 @@ def apply_rules_to_transactions(transactions: list[dict]) -> dict[int, str]:
     if not rules:
         return {}
 
+    # Sort: type-specific rules first, then generic (NULL type), then by match_count
+    typed_rules = [r for r in rules if r.get("txn_type")]
+    generic_rules = [r for r in rules if not r.get("txn_type")]
+    ordered_rules = typed_rules + generic_rules
+
     results: dict[int, str] = {}
     for txn in transactions:
         desc_upper = txn["description"].upper()
-        for rule in rules:
+        txn_type = txn.get("type", "")
+        for rule in ordered_rules:
+            rule_type = rule.get("txn_type")
+            # Skip if rule has a specific type that doesn't match
+            if rule_type and rule_type != txn_type:
+                continue
             if rule["keyword"].upper() in desc_upper:
                 results[txn["id"]] = rule["category"]
-                break  # first matching rule wins (highest confidence first)
+                break
 
     return results
+
+
+def delete_rule(rule_id: int) -> None:
+    """Delete a category rule by ID."""
+    with get_connection() as conn:
+        conn.execute("DELETE FROM category_rules WHERE id = ?", (rule_id,))
+
+
+def update_rule(rule_id: int, category: str, txn_type: Optional[str] = None) -> None:
+    """Update a category rule's category and/or txn_type."""
+    with get_connection() as conn:
+        conn.execute(
+            "UPDATE category_rules SET category = ?, txn_type = ? WHERE id = ?",
+            (category, txn_type, rule_id),
+        )
 
 
 def get_categorized_examples(limit: int = 30) -> list[dict]:

@@ -15,6 +15,9 @@ from core.database import (
     add_category,
     find_similar_transactions,
     upsert_category_rule,
+    get_all_rules,
+    delete_rule,
+    update_rule,
 )
 from core.categorizer import categorize_transactions
 
@@ -113,6 +116,10 @@ def render(email_only: Optional[bool] = None):
 
     # Clear the one-shot skip set from the previous cycle
     st.session_state.pop(f"{pfx}_skip_recat_ids", None)
+
+    # Handle deferred widget version bump from dialog actions
+    if st.session_state.pop(f"{pfx}_pending_bump", False):
+        _bump_cat_version(pfx)
 
     # --- Scroll back to last-edited transaction if needed ---
     scroll_target = st.session_state.pop(f"{pfx}scroll_to_txn", None)
@@ -224,6 +231,9 @@ def render(email_only: Optional[bool] = None):
             _bump_cat_version(pfx)
             st.rerun()
 
+    # --- Rule management ---
+    _render_rule_management(pfx, categories)
+
     # --- Transaction list with per-row save ---
     st.subheader(f"Showing {len(txns)} transaction(s)")
     st.caption("Category and Excluded changes save immediately.")
@@ -307,22 +317,24 @@ def _friendly_description(desc: str) -> str:
     return d
 
 
-def _learn_category_rule(description: str, category: str) -> None:
+def _learn_category_rule(description: str, category: str, txn_type: str = None) -> None:
     """Extract the merchant/payee keyword from a description and save as a rule.
 
     Uses _friendly_description to get the meaningful name, then stores it
     so future transactions with the same merchant auto-categorize.
+    Includes txn_type (debit/credit) so the same keyword can map to different
+    categories for debits vs credits.
     """
     keyword = _friendly_description(description)
-    # Skip if the friendly name is the same as the raw description (no extraction)
-    # or if it's too generic
     if not keyword or len(keyword) < 3:
         return
-    # Skip generic keywords that would match too broadly
     skip = {"no description", "transaction", "payment", "upi", "neft", "rtgs", "ach"}
     if keyword.lower() in skip:
         return
-    upsert_category_rule(keyword, category, source="user")
+    # Skip account number fragments like "xx0838)", "A/c: xx1234"
+    if "xx" in keyword.lower() and any(c.isdigit() for c in keyword):
+        return
+    upsert_category_rule(keyword, category, source="user", txn_type=txn_type)
 
 
 def _render_transaction_row(
@@ -393,7 +405,7 @@ def _render_transaction_row(
             if new_cat != current_cat and new_cat and txn_id not in skip_set:
                 update_transaction_category(txn_id, new_cat)
                 # Learn from this correction: extract merchant/payee and save as rule
-                _learn_category_rule(txn["description"], new_cat)
+                _learn_category_rule(txn["description"], new_cat, txn.get("type"))
                 # Add to skip set so the immediate rerun from
                 # _trigger_smart_recat doesn't re-detect the change
                 skip_set.add(txn_id)
@@ -451,6 +463,50 @@ def _inject_scroll_js(txn_id: int):
             setTimeout(tryScroll, 300);
         </script>
     """)
+
+
+# ---------------------------------------------------------------------------
+# Bulk LLM categorization
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Rule management UI
+# ---------------------------------------------------------------------------
+
+def _render_rule_management(pfx: str, categories: list[str]):
+    """Render an expander to view, edit, and delete category rules."""
+    rules = get_all_rules()
+    if not rules:
+        return
+
+    with st.expander(f"Manage Category Rules ({len(rules)} rules)"):
+        for rule in rules:
+            rid = rule["id"]
+            rule_type = rule.get("txn_type") or "Both"
+            type_label = {"debit": "Dr", "credit": "Cr"}.get(rule_type, "Both")
+
+            rc1, rc2, rc3, rc4, rc5 = st.columns([2.5, 1.5, 0.6, 0.5, 0.5])
+
+            with rc1:
+                st.write(f"**{rule['keyword']}**")
+            with rc2:
+                cat_opts = categories
+                cur_idx = cat_opts.index(rule["category"]) if rule["category"] in cat_opts else 0
+                new_cat = st.selectbox(
+                    "cat", options=cat_opts, index=cur_idx,
+                    key=f"{pfx}rule_cat_{rid}", label_visibility="collapsed",
+                )
+                if new_cat != rule["category"]:
+                    update_rule(rid, new_cat, rule.get("txn_type"))
+                    st.rerun()
+            with rc3:
+                st.write(type_label)
+            with rc4:
+                st.caption(f"{rule['match_count']}x")
+            with rc5:
+                if st.button("Del", key=f"{pfx}rule_del_{rid}"):
+                    delete_rule(rid)
+                    st.rerun()
 
 
 # ---------------------------------------------------------------------------

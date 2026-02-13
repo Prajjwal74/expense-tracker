@@ -69,7 +69,11 @@ def _render_donut_card(
     ))
 
     fig.add_annotation(
-        text=f"<b>{center_label}</b><br><span style='font-size:22px'>{center_value}</span>",
+        text=(
+            f"<span style='font-size:12px; color:#888;'>{center_label}</span>"
+            f"<br><br>"
+            f"<span style='font-size:24px; color:#000; font-weight:bold;'>{center_value}</span>"
+        ),
         x=0.5, y=0.5, showarrow=False,
         font=dict(size=13),
     )

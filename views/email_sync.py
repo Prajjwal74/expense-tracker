@@ -29,6 +29,38 @@ from core.categorizer import categorize_transactions
 _EMAIL_CONFIG_KEY = "email_sync_config"
 
 
+@st.dialog("Already Synced")
+def _resync_confirm_dialog(source_key: str):
+    """Popup confirming override of previously synced month."""
+    data = st.session_state.get("_show_resync_dialog", {})
+    month = data.get("month")
+    year = data.get("year")
+    month_name = data.get("month_name", "")
+    count = data.get("count", 0)
+
+    st.warning(
+        f"You have already synced **{count} transaction(s)** for **{month_name}**.\n\n"
+        f"Fetching again will **delete the previous sync** and replace it with fresh data from your email."
+    )
+
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button(
+            f"Override & Re-fetch",
+            type="primary", use_container_width=True,
+        ):
+            # Do the delete NOW inside the dialog (DB write is reliable)
+            _delete_existing_sync(month, year)
+            # Queue the fetch for the next render via deferred flag
+            st.session_state["_pending_resync"] = {"month": month, "year": year}
+            st.session_state.pop("_show_resync_dialog", None)
+            st.rerun()
+    with col2:
+        if st.button("Cancel", use_container_width=True):
+            st.session_state.pop("_show_resync_dialog", None)
+            st.rerun()
+
+
 def render():
     st.header("Email Sync")
     st.caption(
@@ -72,9 +104,27 @@ def render():
     # Email alerts cover both bank and credit card transactions automatically
     source_key = "bank"
 
-    # --- Fetch button ---
-    if st.button("Fetch Transactions from Email", type="primary", use_container_width=True):
+    # --- Fetch button (with override confirmation if already synced) ---
+    month_name = datetime(year, month, 1).strftime("%B %Y")
+    existing_count = _get_existing_sync_count(month, year)
+
+    # Handle deferred resync from dialog (dialog closed, now we fetch)
+    pending = st.session_state.pop("_pending_resync", None)
+    if pending and pending["month"] == month and pending["year"] == year:
         _fetch_and_display(month, year, source_key)
+    elif st.button("Fetch Transactions from Email", type="primary", use_container_width=True):
+        if existing_count > 0:
+            st.session_state["_show_resync_dialog"] = {
+                "month": month, "year": year, "month_name": month_name,
+                "count": existing_count,
+            }
+            st.rerun()
+        else:
+            _fetch_and_display(month, year, source_key)
+
+    # Show override confirmation dialog if needed
+    if st.session_state.get("_show_resync_dialog"):
+        _resync_confirm_dialog(source_key)
 
     # --- Show previously fetched transactions (if any in session state) ---
     if "email_transactions" in st.session_state and st.session_state.email_transactions:
@@ -151,6 +201,30 @@ def _clear_saved_config() -> None:
 # ---------------------------------------------------------------------------
 # Email configuration UI
 # ---------------------------------------------------------------------------
+
+def _get_existing_sync_count(month: int, year: int) -> int:
+    """Return number of email-synced transactions for a given month."""
+    from core.database import get_connection
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) as c FROM transactions "
+            "WHERE uploaded_file LIKE 'email_%' AND month = ? AND year = ?",
+            (month, year),
+        ).fetchone()
+    return row["c"]
+
+
+def _delete_existing_sync(month: int, year: int) -> int:
+    """Delete all email-synced transactions for a given month."""
+    from core.database import get_connection
+    with get_connection() as conn:
+        cursor = conn.execute(
+            "DELETE FROM transactions "
+            "WHERE uploaded_file LIKE 'email_%' AND month = ? AND year = ?",
+            (month, year),
+        )
+    return cursor.rowcount
+
 
 def _render_email_config():
     """Render the email configuration form in an expander."""
