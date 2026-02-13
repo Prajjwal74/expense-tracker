@@ -1,6 +1,10 @@
 .env
 data/*.db
+data/*.log
 __pycache__/
 *.pyc
 .DS_Store
 venv/
+
+# Allow backup database (for new laptop restore)
+!backups/expense_tracker_latest.db

@@ -17,10 +17,27 @@ st.set_page_config(
 
 st.sidebar.title("Expense Tracker")
 
+# --- Restore navigation from URL on first load ---
+_SECTIONS = ["Statements", "Email"]
+_STMT_PAGES = ["Dashboard", "Upload Statement", "Transactions"]
+_EMAIL_PAGES = ["Email Sync", "Dashboard", "Transactions"]
+
+if "nav_restored" not in st.session_state:
+    st.session_state["nav_restored"] = True
+    qp = st.query_params
+    saved_section = qp.get("section", "Statements")
+    saved_page = qp.get("page", "")
+    if saved_section in _SECTIONS:
+        st.session_state["app_section"] = saved_section
+    if saved_section == "Statements" and saved_page in _STMT_PAGES:
+        st.session_state["stmt_page"] = saved_page
+    elif saved_section == "Email" and saved_page in _EMAIL_PAGES:
+        st.session_state["email_page"] = saved_page
+
 # --- Two-section navigation ---
 section = st.sidebar.radio(
     "Section",
-    ["Statements", "Email"],
+    _SECTIONS,
     key="app_section",
     horizontal=True,
 )
@@ -29,9 +46,12 @@ if section == "Statements":
     st.sidebar.caption("Upload & manage bank/credit card statements")
     page = st.sidebar.radio(
         "Navigate",
-        ["Dashboard", "Upload Statement", "Transactions"],
+        _STMT_PAGES,
         key="stmt_page",
     )
+
+    # Persist to URL
+    st.query_params.update({"section": section, "page": page})
 
     if page == "Dashboard":
         from views.dashboard import render
@@ -47,9 +67,12 @@ else:  # Email
     st.sidebar.caption("Fetch transactions from email alerts")
     page = st.sidebar.radio(
         "Navigate",
-        ["Email Sync", "Dashboard", "Transactions"],
+        _EMAIL_PAGES,
         key="email_page",
     )
+
+    # Persist to URL
+    st.query_params.update({"section": section, "page": page})
 
     if page == "Email Sync":
         from views.email_sync import render
